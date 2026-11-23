@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# pre-commit - refuse a commit that touches mapped code while the map is already stale.
+#
+#   cp assets/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#
+# What it catches, and what it does not. The verifier compares the commit recorded in the
+# map with HEAD, so it sees committed drift only and cannot see uncommitted edits. That
+# means this hook lets through the commit that first makes the map stale, and blocks the
+# next commit that touches mapped code. CI on the pull request is the check that holds.
+#
+# Needs scripts/verify_map.py in the repository. Needs python3 or python on the PATH; if
+# neither is found it says so on stderr and lets the commit through.
+#
+# Bypass with: git commit --no-verify
+
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+MAP="${SYSTEM_MAP:-$REPO_ROOT/docs/system-map/system-map.json}"
+VERIFY="$REPO_ROOT/scripts/verify_map.py"
+
+[ -f "$MAP" ] || exit 0
+[ -f "$VERIFY" ] || exit 0
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "system map check skipped: Python was not found (looked for python3 and python)." >&2
+  exit 0
+fi
+
+# One root per line. An empty string is printed as ".", which means the whole repository.
+ROOTS=$(PYTHONIOENCODING=utf-8 "$PY" -c "import json,sys
+for r in json.load(open(sys.argv[1])).get('roots',[]):
+    print(r or '.')" "$MAP")
+[ -n "$ROOTS" ] || exit 0
+
+STAGED=$(git -c core.quotepath=off diff --cached --name-only --no-renames --diff-filter=ACMRD)
+TOUCHED=0
+while read -r r; do
+  # Same spelling rules as the verifier: strip every leading ./, then every leading
+  # and trailing /.
+  while [[ "$r" == ./* ]]; do r="${r#./}"; done
+  r="${r#"${r%%[!/]*}"}"
+  r="${r%"${r##*[!/]}"}"
+  if [ -z "$r" ] || [ "$r" = "." ]; then
+    [ -n "$STAGED" ] && TOUCHED=1
+    continue
+  fi
+  while read -r f; do
+    case "$f" in "$r"/*) TOUCHED=1 ;; esac
+  done <<< "$STAGED"
+done <<< "$ROOTS"
+[ "$TOUCHED" -eq 1 ] || exit 0
+
+# If the map itself is staged, assume the author is doing the right thing and only
+# check that what they staged is internally valid.
+if echo "$STAGED" | grep -q "system-map.json"; then
+  "$PY" "$VERIFY" "$MAP" --repo "$REPO_ROOT" >/dev/null 2>&1 && exit 0
+fi
+
+OUT="$("$PY" "$VERIFY" "$MAP" --repo "$REPO_ROOT" 2>&1)"
+if [ $? -ne 0 ]; then
+  echo ""
+  echo "$OUT"
+  echo ""
+  echo "This commit touches mapped code, and the system map is already stale: code that is"
+  echo "already committed has drifted from it. Update the map for that committed code first:"
+  echo "  1. Edit docs/system-map/system-map.json for the suspect nodes listed above."
+  echo "  2. Set \"commit\" to the short SHA of that code commit, and \"generated\" to today."
+  echo "  3. python3 scripts/render_map.py docs/system-map/system-map.json"
+  echo "  4. python3 scripts/verify_map.py docs/system-map/system-map.json --repo ."
+  echo "  5. Commit the map files on their own: git add docs/system-map && git commit docs/system-map"
+  echo "Then commit the change you were making."
+  echo ""
+  echo "Bypass with: git commit --no-verify"
+  exit 1
+fi
+
+exit 0

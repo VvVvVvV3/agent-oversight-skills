@@ -1,0 +1,61 @@
+{
+  "name": "vestn-daily-intel-brief",
+  "version": 2,
+  "owner": "CJ",
+  "purpose": "Poll watch-list sources each morning, filter and dedupe against prior briefs, draft the daily brief, flag items for CJ, write to the VvV vault.",
+  "step0_verdict": "graph",
+  "step0_reason": "Ownership ambiguity (two routines previously both flagged the same item) and provenance (every brief item cites its source) are central. Shared state exists in the dedupe memory.",
+  "nodes": [
+    { "id": "schedule", "type": "source", "does": "Fires the routine at 06:30 UK each weekday.", "inputs": [], "outputs": ["run_id"] },
+    { "id": "poll-sources", "type": "function", "does": "Fetches new items from the watch list defined in vestn-intel-briefs. Deterministic, no model.", "inputs": ["run_id"], "outputs": ["raw_items"] },
+    { "id": "dedupe", "type": "function", "does": "Drops items already covered in the last 14 briefs using URL and title hash. Owns the dedupe memory.", "inputs": ["raw_items", "dedupe_memory"], "outputs": ["new_items", "dedupe_memory"] },
+    { "id": "classify", "type": "agent", "model": "small", "does": "Scores each new item against the signal thresholds and assigns [SOCIAL], [DECK], or FLAG FOR CJ REVIEW tags.", "inputs": ["new_items"], "outputs": ["scored_items"] },
+    { "id": "draft-brief", "type": "agent", "model": "mid", "does": "Writes the brief in house format from scored items above threshold, citing source per item.", "inputs": ["scored_items"], "outputs": ["draft"] },
+    { "id": "verify-brief", "type": "verifier", "model": "mid", "does": "Independently checks every cited source exists in raw_items, no item is repeated from prior briefs, frontmatter is valid. Never sees the drafter's reasoning.", "inputs": ["draft", "raw_items"], "outputs": ["verdict"] },
+    { "id": "cj-gate", "type": "gate", "does": "CJ reviews only items tagged FLAG FOR CJ REVIEW. Everything else passes on verifier acceptance.", "gate_actions": ["approve", "edit", "reject"], "inputs": ["draft", "verdict"], "outputs": ["approved_draft"] },
+    { "id": "write-vault", "type": "sink", "irreversible": false, "does": "Writes the brief to the VvV vault at the destination defined in vestn-intel-briefs. Reversible: a bad write is overwritten next run.", "inputs": ["approved_draft", "draft"], "outputs": [] }
+  ],
+  "edges": [
+    { "from": "schedule", "to": "poll-sources", "payload": "run_id", "trigger": "on-schedule:30 6 * * 1-5" },
+    { "from": "poll-sources", "to": "dedupe", "payload": "raw_items", "trigger": "on-complete" },
+    { "from": "dedupe", "to": "classify", "payload": "new_items", "trigger": "on-complete" },
+    { "from": "classify", "to": "draft-brief", "payload": "scored_items", "trigger": "on-complete" },
+    { "from": "draft-brief", "to": "verify-brief", "payload": "draft", "trigger": "on-complete" },
+    { "from": "poll-sources", "to": "verify-brief", "payload": "raw_items", "trigger": "on-complete" },
+    { "from": "verify-brief", "to": "draft-brief", "payload": "verdict (rejections only)", "trigger": "on-reject" },
+    { "from": "verify-brief", "to": "cj-gate", "payload": "draft, verdict", "trigger": "on-condition:verdict.accepted and FLAG items present" },
+    { "from": "verify-brief", "to": "write-vault", "payload": "draft", "trigger": "on-condition:verdict.accepted and no FLAG items" },
+    { "from": "cj-gate", "to": "write-vault", "payload": "approved_draft", "trigger": "on-approve" },
+    { "from": "cj-gate", "to": "draft-brief", "payload": "edit notes", "trigger": "on-reject" }
+  ],
+  "state": {
+    "store": "vault:VvV/05-Ops/intel-state",
+    "keys": {
+      "run_id": { "written_by": ["schedule"] },
+      "raw_items": { "written_by": ["poll-sources"] },
+      "dedupe_memory": { "written_by": ["dedupe"], "summarised": true },
+      "new_items": { "written_by": ["dedupe"] },
+      "scored_items": { "written_by": ["classify"] },
+      "draft": { "written_by": ["draft-brief"] },
+      "verdict": { "written_by": ["verify-brief"] },
+      "approved_draft": { "written_by": ["cj-gate"] }
+    }
+  },
+  "stop_rules": {
+    "max_iterations": 3,
+    "max_spend": "120k tokens per run",
+    "timeout": "20 minutes",
+    "exit_condition": "verify-brief accepts AND (no FLAG items OR cj-gate approves)",
+    "on_breach": "escalate-to:cj-gate"
+  },
+  "feedback_layers": {
+    "operational": { "present": true, "signals": ["tokens per brief", "run latency", "items per brief"] },
+    "quality": { "present": true, "signals": ["verifier rejection rate", "gate edit rate"] },
+    "governance": { "present": true, "who_moves_thresholds": "CJ, via version bump on this spec" },
+    "audit": { "present": false, "gap": "no quarterly cold read of briefs against what CJ actually acted on" }
+  },
+  "changelog": [
+    { "version": 1, "date": "2026-09-08", "change": "Initial spec reconstructed from the routine prompt. Verifier added; previously the drafter self-checked." },
+    { "version": 2, "date": "2026-11-23", "change": "Added the direct route from verify-brief to write-vault for briefs with nothing flagged. The gate description and the exit condition already assumed it and the edge was missing. Found in review." }
+  ]
+}

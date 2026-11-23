@@ -1,0 +1,51 @@
+name: system map
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # required: the verifier resolves the map's commit in history
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Skip if this repo has no map
+        id: guard
+        run: |
+          if [ -f docs/system-map/system-map.json ]; then
+            echo "mapped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mapped=false" >> "$GITHUB_OUTPUT"
+            echo "No system map in this repo, nothing to verify."
+          fi
+
+      - name: Verify the map still describes the code
+        if: steps.guard.outputs.mapped == 'true'
+        run: python3 scripts/verify_map.py docs/system-map/system-map.json --repo .
+
+      - name: Verify the renders match the JSON
+        if: steps.guard.outputs.mapped == 'true'
+        run: |
+          python3 scripts/render_map.py docs/system-map/system-map.json --out /tmp/rendered
+          fail=0
+          for f in system-map.html system-map.md; do
+            if ! diff -q "docs/system-map/$f" "/tmp/rendered/$f" >/dev/null 2>&1; then
+              echo "::error file=docs/system-map/$f::$f does not match what the JSON renders. Re-run render_map.py and commit the result. Never hand-edit a render."
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Post the map summary
+        if: always() && steps.guard.outputs.mapped == 'true'
+        run: |
+          python3 scripts/verify_map.py docs/system-map/system-map.json --repo . \
+            >> "$GITHUB_STEP_SUMMARY" 2>&1 || true

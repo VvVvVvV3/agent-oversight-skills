@@ -1,0 +1,206 @@
+{
+  "schema": "system-map/v1",
+  "repo": "example-api",
+  "title": "The Order Pipeline",
+  "subtitle": "how an order gets taken, paid for, packed and answered for",
+  "commit": "0000000",
+  "generated": "2026-01-01",
+  "roots": ["src"],
+  "ignore": ["**/*.test.ts", "src/generated/**"],
+  "summary": {
+    "what_this_is": "This service takes an order from the storefront, holds the money, asks the warehouse whether it can actually ship, then either captures the payment or gives it back. Everything that happens after the customer clicks buy lives here.",
+    "how_to_read": "Hover anything for a plain description. The How it's built tab gives the implementation, and Condition lists what is currently wrong with it. The loop in the middle is the retry cycle; everything hanging off it is either a store or somebody else's service.",
+    "hard_part": "Almost every incident in this service has been a timing problem rather than a logic one. Two things that are each correct in isolation disagree about what happened first."
+  },
+  "stats": [
+    { "label": "ENTRYPOINTS", "value": "1" },
+    { "label": "EXTERNAL DEPS", "value": "1" },
+    { "label": "ORDERS / DAY", "value": "~4,100" },
+    { "label": "STATE", "value": "1 stub, 1 not switched on" }
+  ],
+  "groups": [
+    { "id": "intake", "label": "TAKING THE ORDER", "order": 1 },
+    { "id": "money", "label": "THE MONEY", "order": 2 },
+    { "id": "fulfil", "label": "FULFILMENT", "order": 3 },
+    { "id": "data", "label": "WHERE THINGS ARE KEPT", "order": 4 }
+  ],
+  "nodes": [
+    {
+      "id": "A",
+      "label": "CHECKOUT ENDPOINT",
+      "group": "intake",
+      "kind": "entrypoint",
+      "height": 1,
+      "what_it_does": "Takes the basket a customer has just confirmed and turns it into an order that the rest of the system can work on.",
+      "how_its_built": "POST /v1/checkout, Fastify route with a zod body schema. Idempotency key required in the header; duplicates return the original order rather than making a second one.",
+      "condition": "The idempotency key is trusted without checking it belongs to the calling account, so a caller could in principle read back another account's order id.",
+      "state": "ok",
+      "risk": "high",
+      "source": [{ "path": "src/http/checkout.ts", "symbol": "checkoutRoute", "lines": "18-140" }],
+      "steps": [
+        { "id": "A.1", "label": "validate basket", "what": "prices are re-read from the catalogue, never trusted from the client" },
+        { "id": "A.2", "label": "reserve stock", "what": "soft hold for 15 minutes" },
+        { "id": "A.3", "label": "write order", "what": "status PENDING" }
+      ]
+    },
+    {
+      "id": "B",
+      "label": "ORDER STORE",
+      "group": "data",
+      "kind": "store",
+      "height": 2,
+      "what_it_does": "Holds every order and every change that has ever been made to it, so any state the order has been in can be reconstructed.",
+      "how_its_built": "Postgres. Orders table plus an append-only order_events table; current status is a materialised column kept in step by a trigger.",
+      "condition": "The trigger and the application both write status. They have disagreed twice in production.",
+      "state": "partial",
+      "source": [{ "path": "src/store/orders.ts", "symbol": "OrderStore", "lines": "1-260" }]
+    },
+    {
+      "id": "C",
+      "label": "PAYMENT HOLD",
+      "group": "money",
+      "kind": "process",
+      "height": 3,
+      "what_it_does": "Puts a hold on the customer's money without taking it, so the amount is guaranteed to be there when the warehouse confirms.",
+      "how_its_built": "Wraps the card processor's authorise call. Retries on network failure with exponential backoff, five attempts, then gives up and marks the order for review.",
+      "condition": "The backoff constant is read from PAYMENT_BACKOFF_MS, which is not set in any environment file in this repo, so it silently falls back to 200ms.",
+      "state": "ok",
+      "source": [{ "path": "src/payments/hold.ts", "symbol": "placeHold", "lines": "22-118" }]
+    },
+    {
+      "id": "D",
+      "label": "CARD PROCESSOR",
+      "group": "money",
+      "kind": "external",
+      "height": 1,
+      "what_it_does": "The company that actually moves the money. We do not control it and it can be slow or down.",
+      "how_its_built": "Third party REST API over HTTPS, keys in the secret store, 8 second timeout.",
+      "condition": "No circuit breaker. When it is slow, every worker thread waits on it.",
+      "state": "ok",
+      "source": [{ "path": "src/payments/client.ts" }]
+    },
+    {
+      "id": "E",
+      "label": "WAREHOUSE CHECK",
+      "group": "fulfil",
+      "kind": "process",
+      "height": 2,
+      "what_it_does": "Asks whether the things in the order are genuinely on a shelf somewhere and can be sent this week.",
+      "how_its_built": "Calls the warehouse service, then reconciles its answer against the soft hold taken at checkout. Disagreements go to the review queue rather than being resolved automatically.",
+      "condition": "",
+      "state": "ok",
+      "source": [{ "path": "src/fulfilment/check.ts", "symbol": "confirmStock", "lines": "10-96" }]
+    },
+    {
+      "id": "F",
+      "label": "CAPTURE OR REFUND",
+      "group": "money",
+      "kind": "process",
+      "height": 2,
+      "what_it_does": "Once the warehouse has answered, either takes the money that was held or releases it back to the customer.",
+      "how_its_built": "Single function with two branches over the hold reference. Both branches write an order event before calling out, so a crash mid-call is recoverable.",
+      "condition": "",
+      "state": "ok",
+      "source": [{ "path": "src/payments/settle.ts", "symbol": "settle", "lines": "14-88" }]
+    },
+    {
+      "id": "G",
+      "label": "RETRY WORKER",
+      "group": "fulfil",
+      "kind": "job",
+      "height": 2,
+      "what_it_does": "Picks up orders that got stuck part way through and pushes them along, over and over, until they finish or a human is asked.",
+      "how_its_built": "BullMQ worker on a 30 second tick. Reads orders in a non-terminal state older than two minutes and re-enters the pipeline at the step they stopped on.",
+      "condition": "Maximum attempts is 20 with no dead letter queue, so a permanently broken order retries for ten hours and then is simply forgotten.",
+      "state": "partial",
+      "risk": "high",
+      "source": [{ "path": "src/jobs/retry.ts", "symbol": "retryWorker", "lines": "1-124" }]
+    },
+    {
+      "id": "H",
+      "label": "EVENT QUEUE",
+      "group": "data",
+      "kind": "queue",
+      "height": 1,
+      "what_it_does": "Carries the news that something happened to everything else that needs to know.",
+      "how_its_built": "Redis streams, one consumer group per subscriber, at-least-once delivery.",
+      "condition": "Consumers are not idempotent, so a redelivery can send a second confirmation email.",
+      "state": "partial",
+      "source": [{ "path": "src/events/bus.ts", "symbol": "EventBus", "lines": "1-140" }]
+    },
+    {
+      "id": "I",
+      "label": "NOTIFIER",
+      "group": "fulfil",
+      "kind": "process",
+      "height": 1,
+      "what_it_does": "Tells the customer what has happened to their order.",
+      "how_its_built": "Subscribes to the event queue, renders a template, hands it to the email provider.",
+      "condition": "Templates are inline strings. There is no way to preview one without sending it.",
+      "state": "ok",
+      "source": [{ "path": "src/notify/send.ts", "symbol": "notify", "lines": "8-72" }]
+    },
+    {
+      "id": "J",
+      "label": "FRAUD SCORE",
+      "group": "money",
+      "kind": "model",
+      "height": 1,
+      "what_it_does": "Guesses how likely an order is to be fraudulent, so risky ones can be held back for a person to look at.",
+      "how_its_built": "Signature exists and returns a constant 0.0. The real model was never wired up.",
+      "condition": "Every order scores zero, so the review threshold downstream has never once fired.",
+      "state": "stub",
+      "risk": "high",
+      "source": [{ "path": "src/risk/score.ts", "symbol": "scoreOrder", "lines": "1-24" }]
+    },
+    {
+      "id": "K",
+      "label": "AUDIT EXPORT",
+      "group": "data",
+      "kind": "job",
+      "height": 1,
+      "what_it_does": "Writes a daily file of everything that happened, for finance to reconcile against the bank.",
+      "how_its_built": "Nightly cron, streams order events to CSV in object storage. Finished and tested, but the cron entry is commented out.",
+      "condition": "Not switched on. Finance is still reconciling by hand.",
+      "state": "not_wired",
+      "source": [{ "path": "src/jobs/audit_export.ts", "symbol": "exportDay", "lines": "1-90" }]
+    }
+  ],
+  "edges": [
+    { "from": "A", "to": "B", "label": "new order, status PENDING", "kind": "data", "source": [{ "path": "src/http/checkout.ts", "lines": "96-104" }] },
+    { "from": "A", "to": "J", "label": "order for scoring", "kind": "data", "source": [{ "path": "src/http/checkout.ts", "lines": "110-114" }] },
+    { "from": "A", "to": "C", "label": "amount to hold", "kind": "control", "source": [{ "path": "src/http/checkout.ts", "lines": "118-126" }] },
+    { "from": "C", "to": "D", "label": "authorise request", "kind": "data", "source": [{ "path": "src/payments/hold.ts", "lines": "40-58" }] },
+    { "from": "D", "to": "C", "label": "hold reference or decline", "kind": "data" },
+    { "from": "C", "to": "E", "label": "held order", "kind": "control", "source": [{ "path": "src/payments/hold.ts", "lines": "100-110" }] },
+    { "from": "E", "to": "F", "label": "stock confirmed or refused", "kind": "control", "source": [{ "path": "src/fulfilment/check.ts", "lines": "80-92" }] },
+    { "from": "F", "to": "B", "label": "settled or refunded event", "kind": "data", "source": [{ "path": "src/payments/settle.ts", "lines": "60-74" }] },
+    { "from": "B", "to": "H", "label": "order changed", "kind": "async", "source": [{ "path": "src/store/orders.ts", "lines": "210-224" }] },
+    { "from": "H", "to": "I", "label": "customer-facing events", "kind": "async" },
+    { "from": "H", "to": "G", "label": "stall signals", "kind": "async" },
+    { "from": "G", "to": "A", "label": "re-enter at the stopped step", "kind": "conditional", "condition": "order is non-terminal and older than two minutes", "source": [{ "path": "src/jobs/retry.ts", "lines": "58-88" }] },
+    { "from": "B", "to": "K", "label": "day's events", "kind": "data" },
+    { "from": "J", "to": "F", "label": "risk score", "kind": "data" }
+  ],
+  "flows": [
+    {
+      "id": "happy",
+      "label": "Order to money taken",
+      "path": ["A", "C", "E", "F", "B", "H", "G", "A"],
+      "loop": true,
+      "trigger": "customer confirms a basket",
+      "exit": "order reaches SETTLED or REFUNDED, or the retry worker gives up"
+    },
+    {
+      "id": "notify",
+      "label": "Telling the customer",
+      "path": ["B", "H", "I"],
+      "loop": false,
+      "trigger": "any order state change"
+    }
+  ],
+  "unknowns": [
+    "Whether the soft stock hold taken at checkout is ever released when an order is abandoned. No code releases it and no expiry job exists, but stock levels do not appear to drift, so something else may be doing it.",
+    "The exact ordering guarantee the event queue gives when a consumer group falls behind. The library documents at-least-once but not ordering, and we rely on ordering in the notifier."
+  ]
+}

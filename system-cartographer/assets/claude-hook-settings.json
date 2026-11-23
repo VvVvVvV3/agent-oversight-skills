@@ -1,0 +1,27 @@
+{
+  "_comment": "Merge these hooks into the repo's .claude/settings.json. Requires .claude/scripts/check_map.sh and .claude/scripts/verify_map.py, both copied from the system-cartographer skill.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/scripts/check_map.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/scripts/check_map.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
